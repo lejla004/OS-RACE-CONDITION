@@ -2,30 +2,39 @@
  * Click nbfs://nbhost/SystemFileSystem/Templates/Licenses/license-default.txt to change this license
  * Click nbfs://nbhost/SystemFileSystem/Templates/Classes/Class.java to edit this template
  */
-package lockfreeuserinput;
+package osproj;
 
 /**
  *
- * @author Lela
+ * @author Korisnik
  */
-import java.util.Random;
+/**
+ * ReservationAgent — performs:
+ *  1) time-of-check via seatMap.isAvailable(seatId)
+ *  2) simulated delay (to create the TOCTOU window)
+ *  3) time-of-use via seatMap.tryReserve(seatId, threadId)
+ *
+ * On success/failure it reports to the GUI and can notify other listeners if needed.
+ */
+
 
 public class ReservationAgent implements Runnable {
 
     private final int threadId;
     private final SeatMap seatMap;
     private final ReservationApp gui;
-    // NEW: The specific seat this agent is assigned to target
-    private final int targetSeatId; 
+    private final int targetSeatId;
+    private final DelayControl delayControl;
+    private final PauseController pauseController;
 
-    private static final int DELAY_MS = 150;
-
-    // CONSTRUCTOR CHANGE: Accepts targetSeatId
-    public ReservationAgent(int threadId, SeatMap seatMap, ReservationApp gui, int targetSeatId) {
+    public ReservationAgent(int threadId, SeatMap seatMap, ReservationApp gui,
+                            int targetSeatId, DelayControl delayControl, PauseController pauseController) {
         this.threadId = threadId;
         this.seatMap = seatMap;
         this.gui = gui;
         this.targetSeatId = targetSeatId;
+        this.delayControl = delayControl;
+        this.pauseController = pauseController;
     }
 
     @Override
@@ -33,36 +42,37 @@ public class ReservationAgent implements Runnable {
         long startTime = System.currentTimeMillis();
 
         try {
-            // 1. TIME OF CHECK (Read)
+            // --- TIME OF CHECK ---
             boolean available = seatMap.isAvailable(targetSeatId);
             gui.log("Thread " + threadId + " checked seat " + targetSeatId + ": " + (available ? "Available" : "TAKEN"));
 
-            // 2. SIMULATED DELAY (The TOCTOU window where the race occurs)
-            Thread.sleep(DELAY_MS); 
-            
-            // 3. TIME OF USE (The critical commit attempt)
+            // Pause / Step
+            pauseController.waitIfPaused();
+
+            // --- SIMULATED DELAY (TOCTOU window) ---
+            Thread.sleep(delayControl.getDelayMs());
+
+            // Pause / Step again
+            pauseController.waitIfPaused();
+
+            // --- TIME OF USE ---
             boolean success = seatMap.tryReserve(targetSeatId, threadId);
-            
             long duration = System.currentTimeMillis() - startTime;
 
             if (!success) {
                 int actualHolder = seatMap.getCurrentHolder(targetSeatId);
-
-                // Race Lost or already taken
-                gui.log("Thread " + threadId + " FAILED to reserve seat " + targetSeatId + 
+                gui.log("Thread " + threadId + " FAILED to reserve seat " + targetSeatId +
                         " (Lost race to T" + actualHolder + ") - Time: " + duration + "ms");
-                
-                // Visualization: Briefly flash the seat to show the failed attempt
-                gui.flashSeatButton(targetSeatId);
-                
-                // Revert color back to the winner's color or white if the seat wasn't actually taken
-                gui.updateSeatButton(targetSeatId, actualHolder); 
+
+                gui.flashSeatButton(targetSeatId);        // Flash yellow/red
+                gui.updateSeatButton(targetSeatId, actualHolder); // Revert to actual owner
+
             } else {
-                // Race Won
-                gui.log("Thread " + threadId + " RESERVED seat " + targetSeatId + 
+                gui.log("Thread " + threadId + " RESERVED seat " + targetSeatId +
                         " (SUCCESS) - Time: " + duration + "ms");
                 gui.updateSeatButton(targetSeatId, threadId);
             }
+
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }

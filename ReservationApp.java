@@ -1,14 +1,5 @@
-/*
- * Click nbfs://nbhost/SystemFileSystem/Templates/Licenses/license-default.txt to change this license
- * Click nbfs://nbhost/SystemFileSystem/Templates/Classes/Class.java to edit this template
- */
-package lockfreeuserinput;
+package osproj;
 
-/**
- *
- * @author Lela
- */
-import java.awt.Choice;
 import javafx.application.Application;
 import javafx.application.Platform;
 import javafx.geometry.Insets;
@@ -17,27 +8,31 @@ import javafx.scene.control.*;
 import javafx.scene.layout.*;
 import javafx.scene.paint.Color;
 import javafx.stage.Stage;
+import java.util.stream.Collectors;
 
-import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
-import java.util.Random;
+import java.util.stream.Collectors;
 
 public class ReservationApp extends Application {
 
     private static final int ROWS = 5;
     private static final int COLS = 10;
-    private static final int TOTAL_SEATS = ROWS * COLS;
     private Button[][] seatButtons = new Button[ROWS][COLS];
-    private Map<Integer, Color> threadColors = new HashMap<>();
-    
-    public SeatMap seatMap; 
-    private TextArea logArea = new TextArea();
-    private SimulationManager simManager;
 
-    // NEW: Text field for user input
-    private TextField assignmentInput = new TextField(); 
+    private SeatMap seatMap;
+    private SimulatorManager simManager;
+
+    private SimulationConfig config = new SimulationConfig();
+    private DelayControl delayControl = new DelayControl(150);
+    private PauseController pauseController = new PauseController();
+    private LegendPanel legendPanel = new LegendPanel();
+    private TooltipManager tooltipManager = new TooltipManager();
+    private StatsCollector statsCollector = new StatsCollector();
+    private StatsPanel statsPanel = new StatsPanel(statsCollector);
+
+    private TextArea logArea = new TextArea();
+    private TextField assignmentInput = new TextField();
+    private int[] seatOwners = new int[ROWS * COLS]; // 0 = empty, -1 = manual, >0 = threadId
 
     @Override
     public void start(Stage primaryStage) {
@@ -46,26 +41,34 @@ public class ReservationApp extends Application {
 
         // --- Top Controls ---
         HBox topControls = new HBox(10);
-Button startRaceBtn = new Button("Start Race");
-Button resetBtn = new Button("Reset");
-        ChoiceBox<String> modeChoice = new ChoiceBox<>(); 
-modeChoice.getItems().addAll("Locked", "Lock-Free");
-modeChoice.setValue("Locked");
-        
-        // Setup input field
-        assignmentInput.setPromptText("T:SeatIndex (e.g., 1:9, 2:9, 3:10)");
+        Button startRaceBtn = new Button("Start Race");
+        Button resetBtn = new Button("Reset");
+        Button pauseBtn = new Button("Pause");
+        Button stepBtn = new Button("Step");
+
+        ChoiceBox<String> modeChoice = new ChoiceBox<>();
+        modeChoice.getItems().addAll("Locked", "LockFree", "Synchronized", "ReadWriteLock");
+        modeChoice.setValue("Locked");
+
+        Slider delaySlider = new Slider(50, 1000, 150);
+        delaySlider.setShowTickLabels(true);
+        delaySlider.setShowTickMarks(true);
+        delaySlider.valueProperty().addListener((obs, oldV, newV) -> delayControl.setDelayMs(newV.longValue()));
+
+        assignmentInput.setPromptText("T:Seat (e.g., 1:9,2:9)");
         assignmentInput.setPrefWidth(250);
-        assignmentInput.setText("1:9, 2:9, 3:10"); // Default race setup for convenience
+        assignmentInput.setText("1:9, 2:9, 3:10");
 
         topControls.getChildren().addAll(
-            startRaceBtn, resetBtn, 
-            new Label("Mode:"), modeChoice, 
-            new Label("Assignments:"), assignmentInput
+                startRaceBtn, resetBtn, pauseBtn, stepBtn,
+                new Label("Mode:"), modeChoice,
+                new Label("Delay(ms):"), delaySlider,
+                new Label("Assignments:"), assignmentInput
         );
         topControls.setPadding(new Insets(10));
         root.setTop(topControls);
 
-        // --- Center Seat Grid ---
+        // --- Seat Grid ---
         GridPane seatGrid = createSeatGrid();
         root.setCenter(seatGrid);
 
@@ -76,7 +79,7 @@ modeChoice.setValue("Locked");
         bottomBox.setPadding(new Insets(10));
         root.setBottom(bottomBox);
 
-        Scene scene = new Scene(root, 850, 600);
+        Scene scene = new Scene(root, 1000, 650);
         primaryStage.setScene(scene);
         primaryStage.setTitle("Lock-Free Race Condition Simulator");
         primaryStage.show();
@@ -84,117 +87,124 @@ modeChoice.setValue("Locked");
         // --- Event Handlers ---
         startRaceBtn.setOnAction(e -> startRace(modeChoice.getValue(), assignmentInput.getText()));
         resetBtn.setOnAction(e -> resetSimulation());
+        pauseBtn.setOnAction(e -> pauseController.pause());
+        stepBtn.setOnAction(e -> pauseController.step());
     }
 
     private GridPane createSeatGrid() {
-        GridPane seatGrid = new GridPane();
-        seatGrid.setHgap(5);
-        seatGrid.setVgap(5);
-        seatGrid.setPadding(new Insets(10));
-        
+        GridPane grid = new GridPane();
+        grid.setHgap(5);
+        grid.setVgap(5);
+        grid.setPadding(new Insets(10));
+
         for (int i = 0; i < ROWS; i++) {
             for (int j = 0; j < COLS; j++) {
-                int seatIndex = i * COLS + j;
-                // Display seat index + 1 for user readability (Seat 1, Seat 2, etc.)
-                Button btn = new Button("S" + (seatIndex + 1)); 
+                int seatId = i * COLS + j;
+                Button btn = new Button("S" + (seatId + 1));
                 btn.setPrefSize(60, 40);
                 btn.setStyle("-fx-background-color: white; -fx-border-color: black;");
-                seatGrid.add(btn, j, i);
                 seatButtons[i][j] = btn;
+                int finalSeatId = seatId;
+                btn.setOnAction(ev -> handleManualClick(finalSeatId));
+                grid.add(btn, j, i);
             }
         }
-        return seatGrid;
+        return grid;
     }
 
-    private void startRace(String mode, String assignmentString) {
-        if (simManager != null) simManager.stopSimulation();
-        
-        // 1. PARSE USER INPUT
-        List<int[]> assignments = parseAssignments(assignmentString);
-        
-        if (assignments.isEmpty()) {
-            log("Error: No valid thread assignments found. Please use format T:SeatIndex (e.g., 1:9, 2:9).");
-            return;
-        }
-        
-        // 2. Setup map and visualization
-        if (mode.equals("Locked")) {
-            seatMap = new LockedSeatMap(TOTAL_SEATS);
-        } else {
-            seatMap = new LockFreeSeatMap(TOTAL_SEATS);
-        }
-        
-        resetSeats(); 
-        assignThreadColors(assignments); 
-        
-        // 3. Start the simulation
-        simManager = new SimulationManager(assignments, seatMap, this);
-        simManager.startSimulation();
-    }
-    
-    // NEW Helper Method to parse the input
-    private List<int[]> parseAssignments(String input) {
-        List<int[]> assignments = new ArrayList<>();
-        if (input == null || input.trim().isEmpty()) return assignments;
-        
-        // Split by comma for each assignment (e.g., "1:9, 2:9")
-        String[] parts = input.split(",");
-
-        for (String part : parts) {
-            try {
-                // Split each assignment by colon (e.g., "1:9")
-                String[] tokens = part.trim().split(":");
-                if (tokens.length == 2) {
-                    // tokens[0] is the Thread ID, tokens[1] is the Seat Index
-                    int threadId = Integer.parseInt(tokens[0].trim());
-                    int seatId = Integer.parseInt(tokens[1].trim());
-                    
-                    if (seatId >= 0 && seatId < TOTAL_SEATS && threadId > 0) {
-                        assignments.add(new int[]{threadId, seatId});
-                    } else {
-                        log("Warning: Invalid ID or Seat Index (" + seatId + ") is out of bounds (0-" + (TOTAL_SEATS - 1) + "). Skipped.");
-                    }
-                }
-            } catch (NumberFormatException e) {
-                log("Warning: Invalid assignment format detected: " + part + ". Skipped.");
-            }
-        }
-        return assignments;
-    }
-
-    private void assignThreadColors(List<int[]> assignments) {
-        Random rand = new Random();
-        threadColors.clear();
-        
-        for (int[] assignment : assignments) {
-             int threadId = assignment[0];
-             if (!threadColors.containsKey(threadId)) {
-                 threadColors.put(threadId, Color.hsb(rand.nextDouble() * 360, 0.8, 0.8));
-             }
+    private void handleManualClick(int seatId) {
+        if (seatMap != null) {
+            boolean success = seatMap.tryReserve(seatId, -1); // -1 = manual
+            seatOwners[seatId] = success ? -1 : seatMap.getCurrentHolder(seatId);
+            updateSeatButton(seatId, seatOwners[seatId]);
+            tooltipManager.updateTooltip(seatId, seatOwners[seatId]);
+            log("Manual click on seat " + seatId + " → " + (success ? "Reserved" : "Already taken"));
         }
     }
 
-    public void updateSeatButton(int seatId, int threadId) {
-        int row = seatId / COLS;
-        int col = seatId % COLS;
-        Platform.runLater(() -> {
-            Button btn = seatButtons[row][col];
-            Color c = Color.WHITE;
-            
-            if (threadId > 0) { // Reserved by a thread
-                c = threadColors.getOrDefault(threadId, Color.BLACK);
-            }
-            
-            btn.setStyle("-fx-background-color: " + toRgbString(c) + "; -fx-border-color: black;");
-        });
+   private void startRace(String mode, String assignmentStr) {
+    // Stop any previous simulation
+    if (simManager != null) simManager.stopSimulation();
+
+    // Parse assignments
+    List<Assignment> assignments = AssignmentParser.parse(assignmentStr, ROWS * COLS);
+    if (assignments.isEmpty()) {
+        log("No valid assignments found!");
+        return;
     }
-    
+    config.setAssignments(assignments);
+
+    // Setup SeatMap
+    seatMap = ModeSwitcher.createSeatMap(mode, ROWS * COLS);
+
+    // Assign thread colors
+    legendPanel.assignColors(assignments);
+
+    // Reset seats and stats
+    resetSeats();
+    statsCollector.start();
+
+    // Start simulation
+    simManager = new SimulatorManager(assignments, seatMap, this, delayControl.getDelayMs());
+    simManager.startSimulation();
+}
+
+
     public void flashSeatButton(int seatId) {
         int row = seatId / COLS;
         int col = seatId % COLS;
+
+        Platform.runLater(() -> seatButtons[row][col].setStyle("-fx-background-color: yellow; -fx-border-color: red;"));
+
+        // Revert after 200ms
+        new Thread(() -> {
+            try {
+                Thread.sleep(200);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            int ownerId = seatOwners[seatId];
+            Platform.runLater(() -> updateSeatButton(seatId, ownerId));
+        }).start();
+    }
+
+    public void updateSeatButton(int seatId, int threadId) {
+        seatOwners[seatId] = threadId; // store owner
+        int row = seatId / COLS;
+        int col = seatId % COLS;
+
         Platform.runLater(() -> {
             Button btn = seatButtons[row][col];
-            btn.setStyle("-fx-background-color: yellow; -fx-border-color: red;");
+            Color color;
+
+            if (threadId > 0) {
+                color = legendPanel.getColor(threadId); // thread color
+            } else if (threadId == -1) {
+                color = Color.GRAY; // manual reservation
+            } else {
+                color = Color.WHITE; // available
+            }
+
+            btn.setStyle("-fx-background-color: " + toRgbString(color) + "; -fx-border-color: black;");
+        });
+    }
+
+    private void resetSimulation() {
+        if (simManager != null) simManager.stopSimulation();
+        resetSeats();
+        statsCollector.end();
+        log("Simulation reset.");
+    }
+
+    private void resetSeats() {
+        for (int i = 0; i < seatOwners.length; i++) seatOwners[i] = 0; // clear owners
+        Platform.runLater(() -> {
+            for (int i = 0; i < ROWS; i++) {
+                for (int j = 0; j < COLS; j++) {
+                    seatButtons[i][j].setStyle("-fx-background-color: white; -fx-border-color: black;");
+                }
+            }
+            logArea.clear();
         });
     }
 
@@ -202,23 +212,16 @@ modeChoice.setValue("Locked");
         Platform.runLater(() -> logArea.appendText(msg + "\n"));
     }
 
-    private void resetSimulation() {
-        if (simManager != null) simManager.stopSimulation();
-        resetSeats();
-    }
-    
-    private void resetSeats() {
-        for (int i = 0; i < ROWS; i++) {
-            for (int j = 0; j < COLS; j++) {
-                seatButtons[i][j].setStyle("-fx-background-color: white; -fx-border-color: black;");
-            }
-        }
-        logArea.clear();
-    }
-
     private String toRgbString(Color c) {
-        return "rgb(" + (int)(c.getRed()*255) + "," + (int)(c.getGreen()*255) + "," + (int)(c.getBlue()*255) + ")";
+        return "rgb(" + (int) (c.getRed() * 255) + "," + (int) (c.getGreen() * 255) + "," + (int) (c.getBlue() * 255) + ")";
     }
+public DelayControl getDelayControl() {
+    return delayControl;
+}
+
+public PauseController getPauseController() {
+    return pauseController;
+}
 
     public static void main(String[] args) {
         launch(args);
